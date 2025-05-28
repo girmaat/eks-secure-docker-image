@@ -1,0 +1,34 @@
+replicaCount: 2
+
+image:
+  repository: <your_ecr_repo_uri>/secure-image
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: nginx
+  host: secure-api.local
+  tls:
+    enabled: true
+    secretName: secure-api-tls
+    issuer: letsencrypt-prod
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 60

@@ -14,11 +14,20 @@ spec:
       labels:
         app: secure-api
     spec:
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: secure-api
           image: <your_ecr_uri>/secure-image:<git_sha>
           ports:
             - containerPort: 8000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           livenessProbe:
             httpGet:
               path: /healthz

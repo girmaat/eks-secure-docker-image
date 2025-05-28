@@ -1,0 +1,6 @@
+apiVersion: v2
+name: secure-api
+description: A Helm chart for deploying secure FastAPI app on EKS
+type: application
+version: 0.1.0
+appVersion: "1.0"

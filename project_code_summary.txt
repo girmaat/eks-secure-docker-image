@@ -1,0 +1,1028 @@
+1. app/README.md
+
+# app/
+
+This is a minimal FastAPI service used to demonstrate secure Docker image practices and Kubernetes deployment readiness.
+
+## Endpoints
+
+- `/` - Root message
+- `/healthz` - Liveness probe target
+- `/readyz` - Readiness probe target
+
+## How to Run Locally
+
+```bash
+pip install -r requirements.txt
+uvicorn main:app --reload
+
+
+
+2. app/main.py
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"message": "Welcome to eks-secure-docker-image!"}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "healthy"}
+
+@app.get("/readyz")
+def readyz():
+    return {"status": "ready"}
+
+
+
+3. app/requirements.txt
+
+fastapi==0.110.1
+uvicorn[standard]==0.29.0
+setuptools==65.5.1
+
+
+
+4. app/Dockerfile
+
+# ────────🔧 BUILD STAGE ────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Create and activate a virtual environment
+RUN python -m venv /venv
+
+# Install deps inside the venv
+COPY requirements.txt .
+RUN /venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# ────────🔐 RUNTIME STAGE ────────
+FROM python:3.11-slim
+
+# Add non-root user
+RUN adduser --disabled-password appuser
+USER appuser
+
+WORKDIR /app
+
+# Copy app code and venv
+COPY --chown=appuser:appuser . .
+COPY --from=builder /venv /venv
+
+# Activate virtualenv
+ENV PATH="/venv/bin:$PATH"
+
+# OCI Labels
+ARG BUILD_DATE="unset"
+LABEL org.opencontainers.image.source="https://github.com/yourorg/eks-secure-docker-image"
+LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.authors="you@example.com"
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+
+5. .github/workflows/docker-build.yml
+
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Extract Git metadata
+      id: meta
+      run: |
+        echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        echo "branch=$(echo ${GITHUB_REF#refs/heads/})" >> $GITHUB_OUTPUT
+
+    - name: Build and Push Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./app
+        file: ./app/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.ECR_REGISTRY }}/secure-image:${{ steps.meta.outputs.sha }}
+          ${{ secrets.ECR_REGISTRY }}/secure-image:${{ steps.meta.outputs.branch }}
+        cache-from: type=registry,ref=${{ secrets.ECR_REGISTRY }}/secure-image:buildcache
+        cache-to: type=registry,ref=${{ secrets.ECR_REGISTRY }}/secure-image:buildcache,mode=max
+
+    - name: Scan Docker image with Trivy
+      uses: aquasecurity/trivy-action@v0.13.1
+      with:
+        image-ref: ${{ secrets.ECR_REGISTRY }}/secure-image:${{ steps.meta.outputs.sha }}
+        format: table
+        severity: HIGH,CRITICAL
+        ignore-unfixed: true
+
+
+
+6. scripts/fix-aws-time-skew.sh
+
+#!/bin/bash
+set -euo pipefail
+
+BLUE='\033[1;34m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+echo -e "${BLUE}🔧 Restarting chronyd...${NC}"
+sudo systemctl restart chronyd
+
+echo -e "${BLUE}⏱️ Forcing immediate time sync with 'chronyc makestep'...${NC}"
+sudo chronyc makestep
+
+echo -e "${BLUE}🔍 Checking new system time drift...${NC}"
+chronyc tracking
+
+echo -e "${BLUE}🔐 Verifying AWS credentials (sts get-caller-identity)...${NC}"
+if aws sts get-caller-identity > /dev/null 2>&1; then
+  echo -e "${GREEN}[✔] AWS credentials are now valid. Time is synced.${NC}"
+else
+  echo -e "${RED}[✘] AWS authentication still failing. Check your credentials or session.${NC}"
+  exit 1
+fi
+
+
+
+7. scripts/push-to-ecr.sh
+
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Set variables (replace placeholders with real values)
+AWS_ACCOUNT_ID="<your-account-id>"
+AWS_REGION="<your-region>"
+REPO_NAME="secure-image"
+GIT_SHA=$(git rev-parse --short HEAD)
+
+ECR_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME"
+
+echo "Step 1: Logging into Amazon ECR..."
+aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_URI
+echo "Logged in to ECR: $ECR_URI"
+
+echo "Step 2: Tagging local image with Git SHA ($GIT_SHA)..."
+docker tag secure-image:$GIT_SHA $ECR_URI:$GIT_SHA
+echo "Image tagged as: $ECR_URI:$GIT_SHA"
+
+echo "Step 3: Pushing image to ECR..."
+docker push $ECR_URI:$GIT_SHA
+echo "Image pushed successfully: $ECR_URI:$GIT_SHA"
+
+echo "Done! Your image is now in Amazon ECR and ready for deployment."
+
+
+8. scripts/test-hpa-scaling.sh
+
+#!/bin/bash
+
+set -e
+
+echo "Step 1: Launching a CPU load generator using busybox..."
+kubectl run cpu-loader --image=busybox --restart=Never -- /bin/sh -c "while true; do :; done"
+
+echo "CPU load generator started (infinite loop consuming CPU)."
+echo
+
+echo "Step 2: Watching current pod CPU usage (via Metrics Server)..."
+echo "NOTE: Press Ctrl+C to stop watching once values appear."
+sleep 5
+kubectl top pods
+
+echo
+echo "Step 3: Watching Horizontal Pod Autoscaler behavior..."
+echo "This will show whether the app scales up based on CPU usage..."
+echo "NOTE: Press Ctrl+C to stop watching when enough data is seen."
+sleep 3
+kubectl get hpa secure-api-hpa --watch
+
+# Final cleanup (uncomment if you want auto-delete after observation)
+echo "Cleaning up load generator pod..."
+kubectl delete pod cpu-loader
+
+echo "🎉 Done. Your HPA should have scaled the deployment if CPU thresholds were crossed."
+
+
+
+9. scripts/setup-ingress-with-alb.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+echo "Checking for AWS Load Balancer Controller..."
+
+if ! kubectl get deployment -n kube-system aws-load-balancer-controller &>/dev/null; then
+    echo "AWS Load Balancer Controller not found. Installing..."
+
+    echo "Step 1: Add EKS chart repo (if not already added)..."
+    helm repo add eks https://aws.github.io/eks-charts
+    helm repo update
+
+    echo "Step 2: Create IAM OIDC provider (manual step if not done)"
+    echo "Please ensure you have created the OIDC provider and IRSA role manually."
+    echo "See: https://docs.aws.amazon.com/eks/latest/userguide/enable-iam-roles-for-service-accounts.html"
+
+    echo "Step 3: Install AWS Load Balancer Controller (cluster-specific values required)..."
+    echo "Replace <your-cluster-name> and <service-account-role-arn> before running the install command."
+
+    cat <<EOF
+# Example install command (do not run blindly):
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=<your-cluster-name> \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=<your-region> \
+  --set vpcId=<your-vpc-id> \
+  --set image.tag="v2.6.1"
+EOF
+
+    echo "Halting script here. Complete AWS Load Balancer Controller setup before re-running."
+    exit 1
+else
+    echo "AWS Load Balancer Controller is installed."
+fi
+
+echo "Applying ingress.yaml to create ALB ingress resource..."
+kubectl apply -f manifests/ingress.yaml
+
+echo "Ingress applied. ALB provisioning may take a few minutes. Monitor with:"
+echo "kubectl get ingress"
+
+
+
+10. scripts/validate-alb-dns.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+INGRESS_NAME="secure-api-ingress"
+NAMESPACE="default"
+
+echo "Checking if Ingress '$INGRESS_NAME' exists..."
+if ! kubectl get ingress $INGRESS_NAME -n $NAMESPACE &>/dev/null; then
+  echo "Ingress $INGRESS_NAME not found in namespace $NAMESPACE."
+  exit 1
+fi
+
+echo "Ingress resource found. Retrieving ALB hostname..."
+ALB_HOSTNAME=$(kubectl get ingress $INGRESS_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+if [ -z "$ALB_HOSTNAME" ]; then
+  echo "ALB is still provisioning. Try again in a few minutes."
+  exit 1
+fi
+
+echo "ALB Hostname: $ALB_HOSTNAME"
+
+echo "Performing DNS lookup..."
+nslookup $ALB_HOSTNAME || dig +short $ALB_HOSTNAME
+
+echo "Testing HTTPS endpoint..."
+curl -k --max-time 5 https://$ALB_HOSTNAME/readyz || {
+  echo "HTTPS probe failed. The ALB may not be ready or cert may not be valid yet."
+  exit 1
+}
+
+echo "ALB and DNS appear to be working. Application is accessible at:"
+echo "https://$ALB_HOSTNAME/"
+
+
+
+11. scripts/deploy-ingress-nginx.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+INGRESS_NAME="secure-api-ingress"
+NAMESPACE="default"
+DOMAIN="secure-api.local"
+
+echo "Applying NGINX Ingress manifest..."
+kubectl apply -f manifests/ingress-nginx.yaml
+
+echo "Waiting for ingress to be created..."
+sleep 5
+kubectl get ingress $INGRESS_NAME -n $NAMESPACE
+
+echo "Checking Ingress address (IP or hostname)..."
+INGRESS_IP=$(kubectl get ingress $INGRESS_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+INGRESS_HOSTNAME=$(kubectl get ingress $INGRESS_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+if [ -n "$INGRESS_IP" ]; then
+  echo "Ingress is accessible at IP: $INGRESS_IP"
+  echo "If using local dev, map this IP to $DOMAIN in /etc/hosts"
+elif [ -n "$INGRESS_HOSTNAME" ]; then
+  echo "Ingress is accessible at hostname: $INGRESS_HOSTNAME"
+else
+  echo "Ingress address not available yet. Try again in a few moments."
+  exit 1
+fi
+
+echo "Testing HTTP access..."
+curl -s http://$DOMAIN/readyz || echo "HTTP request failed."
+
+echo "Testing HTTPS (TLS) access (if cert-manager is configured)..."
+curl -s -k https://$DOMAIN/readyz || echo "HTTPS request failed."
+
+echo "Done. Make sure your DNS or /etc/hosts routes $DOMAIN to the ingress address."
+
+
+
+12. scripts/install-nginx-ingress.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+NAMESPACE="ingress-nginx"
+RELEASE_NAME="nginx-ingress"
+
+echo "Adding NGINX Ingress Helm repo..."
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+echo "Installing NGINX Ingress Controller in namespace '$NAMESPACE'..."
+helm install $RELEASE_NAME ingress-nginx/ingress-nginx --namespace $NAMESPACE --create-namespace
+
+echo "Waiting for ingress controller pods to be ready..."
+kubectl rollout status deployment/${RELEASE_NAME}-controller -n $NAMESPACE
+
+echo "NGINX Ingress Controller installed and running."
+kubectl get pods -n $NAMESPACE -l app.kubernetes.io/name=ingress-nginx
+
+
+
+13. scripts/uninstall-nginx-ingress.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+NAMESPACE="ingress-nginx"
+RELEASE_NAME="nginx-ingress"
+
+echo "🧹 Uninstalling NGINX Ingress Controller..."
+helm uninstall $RELEASE_NAME -n $NAMESPACE
+
+echo "🧼 Deleting namespace '$NAMESPACE'..."
+kubectl delete namespace $NAMESPACE
+
+echo "✅ NGINX Ingress Controller has been fully removed."
+
+
+
+14. scripts/deploy-argocd-app.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+APP_NAME="secure-api"
+NAMESPACE="argocd"
+DEST_NAMESPACE="secure-api"
+REPO_URL="https://github.com/<your-username>/eks-secure-docker-image"
+REPO_PATH="helm/secure-api"
+REVISION="main"
+
+echo "Creating ArgoCD Application manifest..."
+
+mkdir -p argocd
+cat <<EOF > argocd/${APP_NAME}-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  project: default
+  source:
+    repoURL: ${REPO_URL}
+    targetRevision: ${REVISION}
+    path: ${REPO_PATH}
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ${DEST_NAMESPACE}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+EOF
+
+echo "Applying ArgoCD Application..."
+kubectl apply -f argocd/${APP_NAME}-app.yaml
+
+echo "Waiting for ArgoCD application to sync..."
+for i in {1..30}; do
+  SYNC_STATUS=$(kubectl get application ${APP_NAME} -n ${NAMESPACE} -o jsonpath="{.status.sync.status}" 2>/dev/null || echo "Pending")
+  HEALTH_STATUS=$(kubectl get application ${APP_NAME} -n ${NAMESPACE} -o jsonpath="{.status.health.status}" 2>/dev/null || echo "Unknown")
+
+  echo "Sync: ${SYNC_STATUS} | Health: ${HEALTH_STATUS}"
+
+  if [[ "$SYNC_STATUS" == "Synced" && "$HEALTH_STATUS" == "Healthy" ]]; then
+    echo "Application is successfully synced and healthy."
+    break
+  fi
+
+  if [[ $i -eq 30 ]]; then
+    echo "Application failed to sync after waiting 60 seconds."
+    exit 1
+  fi
+
+  sleep 2
+done
+
+echo "Port-forwarding ArgoCD dashboard to https://localhost:8080 ..."
+kubectl port-forward svc/argocd-server -n ${NAMESPACE} 8080:443 &
+
+echo "ArgoCD login info:"
+echo "Username: admin"
+echo -n "Password: "
+kubectl -n ${NAMESPACE} get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+echo
+
+
+
+15. scripts/deploy-eso.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+echo "Applying ESO service account (IRSA)..."
+kubectl apply -f eso/eso-service-account.yaml
+
+echo "Applying ClusterSecretStore..."
+kubectl apply -f eso/clustersecretstore.yaml
+
+echo "Applying ExternalSecret..."
+kubectl apply -f eso/externalsecret.yaml
+
+echo "Waiting for K8s secret to be created..."
+for i in {1..10}; do
+  if kubectl get secret db-secret -n secure-api > /dev/null 2>&1; then
+    echo "Kubernetes secret 'db-secret' has been created!"
+    break
+  fi
+  sleep 3
+done
+
+echo "Decoding and displaying secret value:"
+kubectl get secret db-secret -n secure-api -o jsonpath='{.data.password}' | base64 -d && echo
+
+echo "External Secrets Operator deployment and validation completed."
+
+
+
+16. scripts/create-irsa-role.sh
+
+#!/bin/bash
+
+set -euo pipefail
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+CLUSTER_NAME=$(aws eks list-clusters --query 'clusters[0]' --output text)
+OIDC_URL=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.identity.oidc.issuer" --output text)
+OIDC_HOSTPATH=$(echo $OIDC_URL | sed -e "s~^https://~~")
+
+ROLE_NAME="eso-secrets-access-role"
+POLICY_NAME="ESOSecretsAccess"
+SERVICE_ACCOUNT_NAMESPACE="external-secrets"
+SERVICE_ACCOUNT_NAME="eso-service-account"
+
+echo "Creating trust policy..."
+cat <<EOF > trust-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_HOSTPATH"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "$OIDC_HOSTPATH:sub": "system:serviceaccount:$SERVICE_ACCOUNT_NAMESPACE:$SERVICE_ACCOUNT_NAME"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+echo "Creating IAM role: $ROLE_NAME"
+aws iam create-role   --role-name $ROLE_NAME   --assume-role-policy-document file://trust-policy.json
+
+echo "Attaching inline policy for SecretsManager access..."
+aws iam put-role-policy   --role-name $ROLE_NAME   --policy-name $POLICY_NAME   --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "secretsmanager:GetSecretValue"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }'
+
+echo "Role created and policy attached."
+echo "Use this role ARN in your Kubernetes ServiceAccount annotation:"
+echo "   arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME"
+
+
+
+17. manifests/deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-api
+  labels:
+    app: secure-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secure-api
+  template:
+    metadata:
+      labels:
+        app: secure-api
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: secure-api
+          image: <your_ecr_uri>/secure-image:<git_sha>
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+
+
+
+18. manifests/hpa.yaml
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: secure-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: secure-api
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+
+
+
+19. manifests/service.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: secure-api
+  labels:
+    app: secure-api
+spec:
+  type: ClusterIP
+  selector:
+    app: secure-api
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000
+
+
+
+20. manifests/ingress-nginx.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-api-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: secure-api.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: secure-api
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - secure-api.local
+      secretName: secure-api-tls  
+
+
+
+21. manifests/ingress-alb.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-api-ingress
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/certificate-arn: <your-acm-certificate-arn>
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+spec:
+  ingressClassName: alb
+  rules:
+    - host: secure-api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: secure-api
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - secure-api.example.com
+      secretName: tls-placeholder  
+
+
+
+22. .vscode/extensions.json
+
+{
+  "recommendations": [
+    "ms-azuretools.vscode-docker",
+    "redhat.vscode-yaml",
+    "esbenp.prettier-vscode",
+    "github.vscode-github-actions",
+    "hashicorp.terraform"
+  ]
+}
+
+
+
+23. .vscode/settings.json
+
+{
+  "editor.formatOnSave": true,
+  "files.trimTrailingWhitespace": true,
+  "yaml.validate": true,
+  "docker.languageserver.formatter.enable": true,
+  "[dockerfile]": {
+    "editor.defaultFormatter": "ms-azuretools.vscode-docker"
+  }
+}
+
+
+
+24. helm/secure-api/Chart.yaml
+
+apiVersion: v2
+name: secure-api
+description: A Helm chart for deploying secure FastAPI app on EKS
+type: application
+version: 0.1.0
+appVersion: "1.0"
+
+
+
+25. helm/secure-api/values.yaml
+
+replicaCount: 2
+
+image:
+  repository: <your_ecr_repo_uri>/secure-image
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: nginx
+  host: secure-api.local
+  tls:
+    enabled: true
+    secretName: secure-api-tls
+    issuer: letsencrypt-prod
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 60
+
+
+
+26. helm/secure-api/templates/deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secure-api
+  labels:
+    app: secure-api
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: secure-api
+  template:
+    metadata:
+      labels:
+        app: secure-api
+    spec:
+      containers:
+        - name: secure-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.targetPort }}
+          envFrom:
+            - configMapRef:
+                name: secure-api-config
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.targetPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      securityContext:
+        fsGroup: 1000
+      restartPolicy: Always
+
+
+
+27. helm/secure-api/templates/hpa.yaml
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: secure-api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: secure-api
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+
+
+
+28. helm/secure-api/templates/ingress-alb.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-api-ingress
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.tls.certificateArn }}
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+spec:
+  ingressClassName: alb
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: secure-api
+                port:
+                  number: {{ .Values.service.port }}
+
+
+
+29. helm/secure-api/templates/ingress-nginx.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-api-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuer }}
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: secure-api
+                port:
+                  number: {{ .Values.service.port }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tls.secretName }}
+
+
+
+30. argocd/secure-api-app.yaml
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: secure-api
+  namespace: argocd  # ArgoCD watches apps in this namespace
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<your-username>/eks-secure-docker-image
+    targetRevision: main
+    path: helm/secure-api
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: secure-api
+  syncPolicy:
+    automated:
+      prune: true        # Delete removed resources
+      selfHeal: true     # Auto-reconcile drift
+    syncOptions:
+      - CreateNamespace=true
+
+
+
+31. eso/clustersecretstore.yaml
+
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-store
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-west-2
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: eso-service-account
+            namespace: external-secrets
+
+
+
+32. eso/externalsecret.yaml
+
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: db-secret
+  namespace: secure-api
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secrets-store
+    kind: ClusterSecretStore
+  target:
+    name: db-secret
+    creationPolicy: Owner
+  data:
+    - secretKey: password
+      remoteRef:
+        key: prod/db-password
+
+
+
+33. eso/eso-service-account.yaml
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eso-service-account
+  namespace: external-secrets
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<your-account-id>:role/eso-secrets-access-role
+
+
+

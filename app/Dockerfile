@@ -1,35 +1,37 @@
-# ────────BUILD STAGE ────────
+# ────────🔧 BUILD STAGE ────────
 FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install pip packages
+# Create and activate a virtual environment
+RUN python -m venv /venv
+
+# Install deps inside the venv
 COPY requirements.txt .
-RUN pip install --user -r requirements.txt
+RUN /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# ────────RUNTIME STAGE ────────
-FROM python:3.11-alpine
+# ────────🔐 RUNTIME STAGE ────────
+FROM python:3.11-slim
 
-# Add a non-root user
-RUN adduser -D appuser
+# Add non-root user
+RUN adduser --disabled-password appuser
 USER appuser
 
 WORKDIR /app
 
-# Copy only necessary files from builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
-
-# Copy application code
+# Copy app code and venv
 COPY --chown=appuser:appuser . .
+COPY --from=builder /venv /venv
 
-# Optional: Add labels for metadata (OCI standard)
+# Activate virtualenv
+ENV PATH="/venv/bin:$PATH"
+
+# OCI Labels
+ARG BUILD_DATE="unset"
 LABEL org.opencontainers.image.source="https://github.com/yourorg/eks-secure-docker-image"
 LABEL org.opencontainers.image.version="1.0.0"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.authors="you@example.com"
 
-# Expose port for uvicorn
 EXPOSE 8000
-
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
